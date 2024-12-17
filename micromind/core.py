@@ -17,6 +17,8 @@ import torch
 from accelerate import Accelerator
 from tqdm import tqdm
 import warnings
+import os 
+import csv
 
 from .utils.helpers import get_logger
 from .utils.checkpointer import Checkpointer
@@ -679,3 +681,62 @@ class MicroMind(ABC):
         logger.info(s_out)
 
         return test_metrics
+    
+    def enable_activation_recording(self, output_file: str):
+        """
+        Enable recording of activations during testing.
+
+        Arguments
+        ---------
+        output_file : str
+            Path to the file where activations will be saved.
+        """
+        self.record_activations = True
+        self._activation_file = output_file
+        self._hooks = []  # To store references to registered hooks
+
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(self._activation_file), exist_ok=True)
+
+        # Open the file and write headers (we'll append data later)
+        self._activation_file_handle = open(self._activation_file, "w", newline="")
+        self._csv_writer = csv.writer(self._activation_file_handle)
+        self._csv_writer.writerow(["Layer Name", "Layer Type", "Activation Shape", "Activations"])  # Headers
+
+        # Function to create and return a forward hook
+        def activation_hook(module, input, output, name):
+            if isinstance(output, torch.Tensor):
+                activation_data = output.detach().cpu().numpy()
+                self._csv_writer.writerow([name, module.__class__.__name__, activation_data.shape, activation_data.tolist()])
+            elif isinstance(output, (list, tuple)):
+                for idx, out in enumerate(output):
+                    if isinstance(out, torch.Tensor):
+                        activation_data = out.detach().cpu().numpy()
+                        self._csv_writer.writerow([f"{name}[{idx}]", module.__class__.__name__, activation_data.shape, activation_data.tolist()])
+            # Flush to ensure data is written to the file
+            self._activation_file_handle.flush()
+
+        # Register hooks for all leaf modules
+        for name, module in self.modules.items():  # self.modules is assumed to be a ModuleDict
+            for sub_name, layer in module.named_modules():
+                # Register hooks only for leaf modules
+                if len(list(layer.children())) == 0:  
+                    hook_name = f"{name}.{sub_name}"  # Combine names for uniqueness
+                    hook = layer.register_forward_hook(
+                        lambda m, i, o, n=hook_name: activation_hook(m, i, o, n)
+                    )
+                    self._hooks.append(hook)  # Store the hook reference
+
+    def close_activation_file(self):
+        """
+        Close the activation recording file and remove forward hooks.
+        """
+        # Remove all registered forward hooks
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []  # Clear the hooks list
+
+        # Close the file handle
+        if hasattr(self, "_activation_file_handle"):
+            self._activation_file_handle.close()
+            print(f"Activation file {self._activation_file} closed.")
