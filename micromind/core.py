@@ -17,8 +17,9 @@ import torch
 from accelerate import Accelerator
 from tqdm import tqdm
 import warnings
-import os 
-import csv
+import uuid
+from functools import partial
+
 
 from .utils.helpers import get_logger
 from .utils.checkpointer import Checkpointer
@@ -165,6 +166,8 @@ class MicroMind(ABC):
         self.device = self.accelerator.device
 
         self.current_epoch = 0
+
+        self._hooks_dict = {}  # Store hooks with progressive keys for later removal
 
     @abstractmethod
     def forward(self, batch):
@@ -681,62 +684,64 @@ class MicroMind(ABC):
         logger.info(s_out)
 
         return test_metrics
-    
-    def enable_activation_recording(self, output_file: str):
-        """
-        Enable recording of activations during testing.
 
-        Arguments
-        ---------
-        output_file : str
-            Path to the file where activations will be saved.
-        """
-        self.record_activations = True
-        self._activation_file = output_file
-        self._hooks = []  # To store references to registered hooks
+    def attach_hook_fn(self, hook_fn: Callable, to_record: List[str] = None):
+        if to_record is None:
+            logger.warning("No specific modules provided. Recording activations for all available modules.")
+            to_record = list(self.modules.keys())
 
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(self._activation_file), exist_ok=True)
+        hooks_created = []  # Track hooks created in this call
 
-        # Open the file and write headers (we'll append data later)
-        self._activation_file_handle = open(self._activation_file, "w", newline="")
-        self._csv_writer = csv.writer(self._activation_file_handle)
-        self._csv_writer.writerow(["Layer Name", "Layer Type", "Activation Shape", "Activations"])  # Headers
+        for entry in to_record:
+            module_name, *layer_name_parts = entry.split('.')
+            layer_name = '.'.join(layer_name_parts)
 
-        # Function to create and return a forward hook
-        def activation_hook(module, input, output, name):
-            if isinstance(output, torch.Tensor):
-                activation_data = output.detach().cpu().numpy()
-                self._csv_writer.writerow([name, module.__class__.__name__, activation_data.shape, activation_data.tolist()])
-            elif isinstance(output, (list, tuple)):
-                for idx, out in enumerate(output):
-                    if isinstance(out, torch.Tensor):
-                        activation_data = out.detach().cpu().numpy()
-                        self._csv_writer.writerow([f"{name}[{idx}]", module.__class__.__name__, activation_data.shape, activation_data.tolist()])
-            # Flush to ensure data is written to the file
-            self._activation_file_handle.flush()
+            try:
+                module = self.modules[module_name]
+            except KeyError:
+                logger.error(f"Module '{module_name}' not found in self.modules. Skipping...")
+                continue
 
-        # Register hooks for all leaf modules
-        for name, module in self.modules.items():  # self.modules is assumed to be a ModuleDict
-            for sub_name, layer in module.named_modules():
-                # Register hooks only for leaf modules
-                if len(list(layer.children())) == 0:  
-                    hook_name = f"{name}.{sub_name}"  # Combine names for uniqueness
-                    hook = layer.register_forward_hook(
-                        lambda m, i, o, n=hook_name: activation_hook(m, i, o, n)
-                    )
-                    self._hooks.append(hook)  # Store the hook reference
+            if not layer_name:
+                # Register hooks for all leaf layers in the module
+                for sub_name, layer in module.named_modules():
+                    if len(list(layer.children())) == 0:  # Only leaf layers
+                        hook_name = f"{module_name}.{sub_name}"
+                        hook_ref = layer.register_forward_hook(
+                            partial(hook_fn, name=hook_name)
+                        )
+                        hooks_created.append(hook_ref)
+            else:
+                # Register hook for the specific layer
+                layer = dict(module.named_modules()).get(layer_name)
+                if layer is None:
+                    logger.error(f"Layer '{entry}' not found in module '{module_name}'. Skipping...")
+                    continue
 
-    def close_activation_file(self):
-        """
-        Close the activation recording file and remove forward hooks.
-        """
-        # Remove all registered forward hooks
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks = []  # Clear the hooks list
+                hook_ref = layer.register_forward_hook(
+                    partial(hook_fn, name=entry)
+                )
+                hooks_created.append(hook_ref)
+        
+        if hooks_created:
+            hook_key = str(uuid.uuid4())  # Generate a unique key
+            self._hooks_dict[hook_key] = hooks_created
+            logger.info(f"Hooks successfully created with key: {hook_key}")
+        else:
+            logger.warning("No hooks were created. Please check the specified modules and layers.")
+        
+        return hook_key
 
-        # Close the file handle
-        if hasattr(self, "_activation_file_handle"):
-            self._activation_file_handle.close()
-            print(f"Activation file {self._activation_file} closed.")
+    def detach_hook_fn(self, keys: List[str] = None):
+        if keys is None:
+            logger.error("No keys provided for detachment. Available keys: %s", list(self._hooks_dict.keys()))
+            return
+
+        for key in keys:
+            hook_refs = self._hooks_dict.pop(key, None)
+            if hook_refs:
+                for hook_ref in hook_refs:  # Ensure all hooks under this key are removed
+                    hook_ref.remove()
+                logger.info(f"All hooks with key '{key}' detached.")
+            else:
+                logger.error(f"Hook with key '{key}' not found. Available keys: %s", list(self._hooks_dict.keys()))
